@@ -1,0 +1,13 @@
+# Demo workload for Phase 2 demonstrates: name,arrival_s,burst_s,priority,cpu_target
+# burst_s = seconds of CPU work; cpu_target = % of one core the worker burns.
+# The first three jobs (j1..j3, all 100% cpu_target) are the hand-check jobs:
+# under FCFS they must finish close to the textbook times:
+#   j1 turnaround ~3.0 s (0..3), j2 ~3.5 (waits 2.5), j3 ~5.0 (waits 3).
+# j5/j6 have <100% cpu_target to show stretch: low targets take longer wall time.
+j1,0.0,3.0,2,100
+j2,0.5,1.0,1,100
+j3,1.0,2.0,3,100
+j4,2.0,1.5,2,100
+j5,3.0,2.5,1,80
+j6,4.0,1.0,3,60
+j7,5.0,2.0,2,100
