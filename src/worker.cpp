@@ -1,23 +1,24 @@
-// Worker: the synthetic CPU-bound job.
+// worker.cpp — the synthetic CPU-bound job, the only "load source".
 //
 //   worker <burst_seconds> <cpu_target_percent>
 //
 // Burns <burst_seconds> OF CPU TIME at roughly <cpu_target_percent> of one
-// core (busy loop + small sleeps inside 50 ms slices). Budgeting uses
-// CLOCK_PROCESS_CPUTIME_ID - process CPU time consumed - so a SIGSTOP freeze
-// costs the job nothing (a wall clock cannot distinguish frozen time; CPU
-// time can). Exits 0 when done.
+// core: inside 50 ms slices it busy-loops for the wanted share and sleeps
+// the rest away.
+//
+// The budget is measured with clock(), which counts CPU time, not wall time:
+// a SIGSTOP freeze costs the job nothing (a stopped process does not consume
+// CPU time), so the job really exits after doing `burst` seconds of work.
+// Exit code 0 = done.
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <thread>
+#include <unistd.h> // usleep
 
-static double cpu_used() {
-    timespec ts;
-    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
-    return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
+// CPU seconds this process has used so far (0 while stopped).
+static double cpu_seconds() {
+    return double(clock()) / double(CLOCKS_PER_SEC);
 }
 
 int main(int argc, char** argv) {
@@ -28,20 +29,19 @@ int main(int argc, char** argv) {
     const double burst = std::atof(argv[1]);
     double target = std::atof(argv[2]);
     if (burst <= 0) return 0;
-    if (target < 1) target = 1;
-    if (target > 100) target = 100;
-    const double on = target / 100; // fraction of a core while allowed to run
-    const double STEP = 0.05;       // 50 ms slices
+    target = std::max(1.0, std::min(100.0, target));
 
-    volatile double spin = 1.234; // volatile: the loop may not be removed
-    while (cpu_used() < burst) {
-        // Busy phase: push process CPU time forward by STEP*on.
-        const double goal = std::min(burst, cpu_used() + STEP * on);
-        while (cpu_used() < goal) spin = spin + 0.137;
-        // Idle phase: shape the CPU share toward the requested target.
+    const double on = target / 100.0;  // share of one core we want to use
+    const double slice = 0.05;         // one slice = 50 ms of wall time
+
+    volatile double spin = 1.234;      // volatile: the compiler may not drop it
+    while (cpu_seconds() < burst) {
+        // 1) busy phase: push our own CPU time forward by slice * on
+        const double goal = std::min(burst, cpu_seconds() + slice * on);
+        while (cpu_seconds() < goal) spin = spin + 0.137;
+        // 2) idle phase: sleep away the rest of the slice (nothing to do at 100%)
         if (on < 1.0)
-            std::this_thread::sleep_for(std::chrono::milliseconds(
-                static_cast<long long>(STEP * (1.0 - on) * 1000)));
+            usleep(static_cast<unsigned>(slice * (1.0 - on) * 1e6));
     }
     (void)spin;
     return 0;

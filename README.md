@@ -39,8 +39,11 @@ logs/run-XYZ fcfs` (or `rr`); manual cases in `tests/checklist.md`.
   from `/proc` → ask the algorithm whether to preempt → dispatch next job.
   RR quantum: 5 ticks = 500 ms (`--quantum-ticks N`).
 - **Single seam**: adding SJF / Priority / MLFQ in Phase 3 = a new class
-  implementing (`on_arrive`, `on_finished`, `on_killed`, `pick_next`,
-  `on_tick`) and nothing else (`include/scheduler.hpp`).
+  implementing (`name`, `on_ready`, `on_gone`, `pick_next`, `should_preempt`)
+  and nothing else (`include/scheduler.hpp`). The interface only ever passes
+  plain `int` job ids — never a pointer.
+- **Plain, university-level C++**: no owning pointers, no threads, no nested
+  containers, no STL tricks — 930 lines total, about a third of them comments.
 - **State machine**: NEW→READY→RUNNING→FINISHED with PAUSED/KILLED paths;
   every transition logged (`src/job_manager.cpp`).
 
@@ -62,7 +65,10 @@ Deviations from the proposal document (deliberate, recorded so nothing is silent
   second invocation could not see them without a daemon.
 - `status` prints at shutdown and on demand (stdin); a separate `jobman status`
   invocation is not possible for the same reason.
-- `IScheduler` has `on_killed(Job*)` so a killed READY job cannot linger in
+- `IScheduler` has `on_gone(id)` so a killed READY job cannot linger in
   the ready queue (correctness, not scope creep).
+- The seam passes plain `int` job ids (not `Job*` as sketched in the
+  proposal): identical behaviour, and no pointer can ever go stale — the
+  whole of A.4-style plainness for the price of one `find(id)` call.
 
 Layout and what to fill before submission see [instructions.md](instructions.md).

@@ -1,21 +1,19 @@
-// jobman: the Phase 2 "mini-kernel" entry point.
+// main.cpp — the entry point of jobman, the Phase 2 "mini-kernel".
 //
 // Usage:
 //   jobman run [--algo fcfs|rr] [--quantum-ticks N] [<workload.csv>|-]
-// (`-` or no file = interactive only; submit jobs from stdin instead)
+// (`-` or no file = interactive only; type the commands on stdin)
 //
-// While running, type commands on stdin:
-//   status | submit ./bin/worker 2 80 | stop ID | cont ID | kill ID | quit
+// While running:  status | submit ./bin/worker 2 80 | stop N | cont N | kill N | quit
 //
 // Model: a 1-CPU machine. At most one child process is RUNNING; it is
 // preempted with SIGSTOP and the next job is dispatched with SIGCONT.
-// Every tick (100 ms) makes one scheduling pass and logs to CSV.
+// A 100 ms tick drives everything and every state change is logged to CSV.
 #include "csv_logger.hpp"
 #include "job_manager.hpp"
 #include "monitor.hpp"
 #include "proc_mgr.hpp"
 #include "scheduler.hpp"
-#include "types.hpp"
 
 #include <poll.h>
 #include <unistd.h>
@@ -28,22 +26,23 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <vector>
 
-static const double TICK_S = 0.1;  // scheduler decision granularity (100 ms)
+static const double TICK_S = 0.1; // one tick = 100 ms
 
-// Monotonic seconds since process start. One clock for the whole program, so
-// timestamps in the logs are comparable between jobs.
+// Monotonic seconds since the program started. One clock for the whole
+// program, so all timestamps in the logs are comparable (wall clocks can
+// jump backwards, a monotonic clock cannot).
 static double now_mono() {
     static struct timespec base = {};
-    static bool init = true;
+    static bool first = true;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    if (init) { base = ts; init = false; }
+    if (first) { base = ts; first = false; }
     return double(ts.tv_sec - base.tv_sec) + double(ts.tv_nsec - base.tv_nsec) / 1e9;
 }
 
+// A signal handler may only set a flag: the teardown runs in main().
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int) { g_stop = 1; }
 
@@ -56,6 +55,7 @@ static void usage() {
         "  status | submit ./bin/worker 2 80 | stop N | cont N | kill N | quit | help\n");
 }
 
+// Split a line into its fields, skipping empty ones.
 static std::vector<std::string> split(const std::string& line, char sep) {
     std::vector<std::string> out;
     std::istringstream ss(line);
@@ -67,8 +67,9 @@ static std::vector<std::string> split(const std::string& line, char sep) {
     return out;
 }
 
+// logs/run-<timestamp>/ is created for every run.
 static std::string make_run_dir() {
-    ::mkdir("logs", 0755); // exists after the first call; failure is harmless
+    ::mkdir("logs", 0755); // exists after the first run; failure is harmless
     char stamp[24];
     const std::time_t t = std::time(nullptr);
     std::strftime(stamp, sizeof stamp, "run-%Y%m%d-%H%M%S", std::localtime(&t));
@@ -77,6 +78,8 @@ static std::string make_run_dir() {
     return dir;
 }
 
+// One workload line: name,arrival_s,burst_s,priority,cpu_target
+//   -> a job that runs  ./bin/worker <burst_s> <cpu_target>
 static void load_workload(JobManager& mgr, const std::string& path) {
     std::ifstream f(path);
     if (!f) {
@@ -86,141 +89,135 @@ static void load_workload(JobManager& mgr, const std::string& path) {
     std::string line;
     while (std::getline(f, line)) {
         if (line.empty() || line[0] == '#') continue;
-        const auto fields = split(line, ',');
+        const std::vector<std::string> fields = split(line, ',');
         if (fields.size() != 5) continue;
-        // name,arrival_s,burst_s,priority,cpu_target  ->  ./bin/worker burst target
         mgr.add_job(fields[0], std::atof(fields[1].c_str()), std::atof(fields[2].c_str()),
                     std::atoi(fields[3].c_str()),
                     {"./bin/worker", fields[2], fields[4]});
     }
 }
 
-// Call once per poll wake: pump all complete lines from stdin. Returns
-// false only on `quit`. EOF simply stops further input.
-static bool pump_stdin(JobManager& mgr, std::string& pending, double now) {
+// One typed line -> one action. Returns false when the user types `quit`.
+static bool run_command(JobManager& mgr, const std::string& line, double now) {
+    const std::vector<std::string> w = split(line, ' ');
+    if (w.empty()) return true;
+    const std::string& cmd = w[0];
+    const int id = w.size() > 1 ? std::atoi(w[1].c_str()) : 0;
+
+    if (cmd == "quit") return false;
+    if (cmd == "help") { usage(); return true; }
+    if (cmd == "status") { mgr.print_status(now); return true; }
+
+    if (cmd == "submit") {
+        if (w.size() < 2) { std::printf("usage: submit ./bin/worker 2 80\n"); return true; }
+        const std::vector<std::string> argv(w.begin() + 1, w.end());
+        // name for the table = the program without its directory
+        const std::string name = argv[0].substr(argv[0].find_last_of('/') + 1);
+        // submitting the worker? then its burst is the first argument
+        const double burst = (argv[0].find("worker") != std::string::npos && argv.size() > 1)
+                                 ? std::atof(argv[1].c_str()) : 0.0;
+        mgr.add_job(name, now, burst, 5, argv);
+        std::printf("job %s submitted\n", name.c_str());
+        return true;
+    }
+
+    bool ok = false;
+    if (cmd == "stop") ok = mgr.user_stop(id, now);
+    else if (cmd == "cont") ok = mgr.user_cont(id, now);
+    else if (cmd == "kill") ok = mgr.user_kill(id, now);
+    else return true; // unknown word: ignore it
+    std::printf("%s job %d: %s\n", cmd.c_str(), id,
+                ok ? "ok" : "not allowed in this state");
+    return true;
+}
+
+// Read whatever the user has typed and run every complete line.
+// Returns false on `quit`; sets `stdin_open` to false at EOF (the run then
+// simply continues without any further commands).
+static bool read_commands(JobManager& mgr, std::string& pending, double now,
+                          bool& stdin_open) {
     char buf[512];
     const ssize_t n = ::read(STDIN_FILENO, buf, sizeof buf);
-    if (n <= 0) return true;
+    if (n == 0) { stdin_open = false; return true; } // EOF: no more input
+    if (n < 0) return true;                          // nothing readable after all
     pending.append(buf, size_t(n));
+
+    // A line may arrive in several reads, so keep the tail in `pending`.
     size_t pos;
     while ((pos = pending.find('\n')) != std::string::npos) {
         const std::string line = pending.substr(0, pos);
         pending.erase(0, pos + 1);
-        const auto words = split(line, ' ');
-        if (words.empty()) continue;
-        const std::string& cmd = words[0];
-        const int id = words.size() > 1 ? std::atoi(words[1].c_str()) : 0;
-        if (cmd == "quit") return false;
-        if (cmd == "help") { usage(); continue; }
-        if (cmd == "status") { mgr.print_status(now); continue; }
-        if (cmd == "submit") {
-            if (words.size() < 2) { std::printf("usage: submit ./bin/worker 2 80\n"); continue; }
-            const auto argv = std::vector<std::string>(words.begin() + 1, words.end());
-            const std::string program =
-                argv[0].substr(argv[0].find_last_of('/') + 1); // table label only
-            // Submitting the worker? infer the burst estimate from its arg.
-            const double burst =
-                (argv[0].find("worker") != std::string::npos && argv.size() > 1)
-                    ? std::atof(argv[1].c_str()) : 0;
-            mgr.add_job(program, now, burst, 5, argv);
-            std::printf("job %s submitted\n", program.c_str());
-            continue;
-        }
-        bool ok = false;
-        if (cmd == "stop") ok = mgr.user_stop(id, now);
-        else if (cmd == "cont") ok = mgr.user_cont(id, now);
-        else if (cmd == "kill") ok = mgr.user_kill(id, now);
-        else continue;
-        std::printf("%s job %d: %s\n", cmd.c_str(), id, ok ? "ok" : "not allowed in this state");
+        if (!run_command(mgr, line, now)) return false;
     }
     return true;
 }
 
 int main(int argc, char** argv) {
+    // ---- command line -------------------------------------------------
     if (argc < 2 || std::string(argv[1]) != "run") {
         usage();
         const std::string first = argc >= 2 ? argv[1] : "";
         return (first == "help" || first == "-h") ? 0 : 1;
     }
-    std::string algo = "rr";   // RR default: the tick clock makes rotation visible
-    int quantum_ticks = 5;     // RR quantum default = 5 ticks = 500 ms
-    std::string file = "-";
+    std::string algo = "rr";  // default: Round Robin makes rotation visible
+    int quantum_ticks = 5;    // default quantum: 5 ticks = 500 ms
+    std::string file = "-";   // workload file, or '-' = interactive only
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--algo" && i + 1 < argc) algo = argv[++i];
         else if (a == "--quantum-ticks" && i + 1 < argc) quantum_ticks = std::atoi(argv[++i]);
-        else file = a; // workload file path, or '-' = none
+        else file = a;
     }
     if ((algo != "fcfs" && algo != "rr") || quantum_ticks < 1) { usage(); return 1; }
 
+    // ---- the pieces of the mini-kernel --------------------------------
     const std::string logdir = make_run_dir();
     CsvLogger logger(logdir);
     ProcMgr proc;
+    ProcSampler sampler;
     FcfsScheduler fcfs;
     RoundRobinScheduler rr(double(quantum_ticks) * TICK_S);
-    IScheduler& sched = (algo == "fcfs") ? static_cast<IScheduler&>(fcfs)
-                                         : static_cast<IScheduler&>(rr);
-    JobManager mgr(logger, proc, sched);
+    // Both objects live for the whole run; jobman only ever talks to them
+    // through the IScheduler interface.
+    IScheduler* chosen = &fcfs;
+    if (algo == "rr") chosen = &rr;
+    JobManager mgr(logger, proc, *chosen);
     if (file != "-") load_workload(mgr, file);
 
-    std::printf("algorithm=%s tick=%.1fs quantum_ticks=%d logs -> %s\n", sched.name().c_str(),
-                TICK_S, quantum_ticks, logdir.c_str());
+    std::printf("algorithm=%s tick=%.1fs quantum_ticks=%d logs -> %s\n",
+                chosen->name().c_str(), TICK_S, quantum_ticks, logdir.c_str());
     std::signal(SIGINT, on_sigint);
 
-    Job* running = nullptr;
-    double dispatch_t = 0;
-    bool keep = true;
-    ProcSampler sampler;
-    std::string pending;
+    // ---- the loop: wait for a tick, then run exactly one tick ----------
+    bool stdin_open = true;   // false after EOF (e.g. `jobman ... < /dev/null`)
+    std::string pending;      // half-typed line, waiting for its newline
     double next_tick = now_mono() + TICK_S;
 
-    while (keep && !g_stop) {
-        // Wait: until the next tick, or stdin wakes us earlier.
-        struct pollfd pfd {STDIN_FILENO, POLLIN, 0};
-        const double rem = next_tick - now_mono();
-        const int r = ::poll(&pfd, 1, rem > 0 ? int(rem * 1000) : 0);
-        if (r > 0 && (pfd.revents & POLLIN) && !pump_stdin(mgr, pending, now_mono())) keep = false;
+    while (!g_stop) {
+        const double remaining = next_tick - now_mono();
+        const int wait_ms = remaining > 0 ? int(remaining * 1000) : 0;
+
+        if (stdin_open) {
+            // Sleep until the next tick OR until the user types something,
+            // whichever comes first (poll = "wake me on one of these events").
+            struct pollfd pfd { STDIN_FILENO, POLLIN, 0 };
+            if (::poll(&pfd, 1, wait_ms) > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+                if (!read_commands(mgr, pending, now_mono(), stdin_open)) break; // quit
+            }
+        } else {
+            ::usleep(unsigned(wait_ms) * 1000u); // no input can arrive any more
+        }
 
         const double now = now_mono();
-        if (now < next_tick || !keep) continue;
+        if (now < next_tick) continue; // an early keystroke: keep waiting
         next_tick += TICK_S;
-
-        for (Job* j : mgr.reap(now)) // children dying frees the CPU slot
-            if (j == running) running = nullptr;
-        mgr.process_arrivals(now);
-
-        if (running) {
-            if (!sampler.sample(running->pid, running->m, now)) {
-                running = nullptr; // died right after the last reap; next reap reports it
-            } else {
-                logger.sample(now, running->id, running->m);
-                if (sched.on_tick(running, now - dispatch_t) && mgr.preempt(*running, now))
-                    running = nullptr;
-            }
-        }
-        if (!running) {
-            Job* j = sched.pick_next();
-            if (j) {
-                mgr.dispatch(*j, now);
-                running = j;
-                dispatch_t = now;
-            }
-        }
-        if (mgr.all_done()) keep = false;
+        mgr.tick(now, sampler);
+        if (mgr.all_done()) break;     // every job is FINISHED or KILLED
     }
 
-    // Shutdown: children never outlive the scheduler.
+    // ---- shutdown: children never outlive the scheduler ---------------
     const double end = now_mono();
-    int cancelled = 0;
-    for (Job& j : mgr.all()) {
-        if (j.state == JobState::FINISHED || j.state == JobState::KILLED) continue;
-        if (j.spawned) proc.kill(j.pid);
-        logger.event(end, j.id, j.state, JobState::KILLED, "shutdown");
-        j.state = JobState::KILLED;
-        j.finish_t = end;
-        ++cancelled;
-    }
-    while (wait(nullptr) > 0) {} // no zombies left behind
+    const int cancelled = mgr.shutdown(end);
     std::printf("\ndone (%d job(s) cancelled at shutdown)\n", cancelled);
     mgr.print_status(end);
     std::printf("logs: %s/{events,samples,metrics}.csv\n", logdir.c_str());
